@@ -1085,17 +1085,51 @@ export class TeamsAdapter implements Adapter<TeamsThreadId, unknown> {
   }
 
   /**
-   * Stream responses via post+edit.
+   * Stream responses via post+edit with throttled updates.
+   * Posts the first message immediately, then edits it at most once per
+   * intervalMs (default 1500ms) to avoid overwhelming the Teams API with
+   * updateActivity calls and triggering 429 quota errors.
    * TODO: Use native HttpStream for DMs once @microsoft/teams.apps exports it.
    */
   async stream(
     threadId: string,
     textStream: AsyncIterable<string | StreamChunk>,
-    _options?: StreamOptions
+    options?: StreamOptions
   ): Promise<RawMessage<unknown>> {
     const { conversationId } = this.decodeThreadId(threadId);
+    const intervalMs = options?.updateIntervalMs ?? 1500;
     let accumulated = "";
     let messageId: string | undefined;
+    let lastSentContent = "";
+    let timerId: ReturnType<typeof setTimeout> | null = null;
+    let pendingEdit: Promise<void> | null = null;
+    let stopped = false;
+
+    const doEdit = async (): Promise<void> => {
+      if (stopped || !messageId || accumulated === lastSentContent) {
+        return;
+      }
+      const content = accumulated;
+      try {
+        const activity = new MessageActivity(content);
+        activity.textFormat = "markdown";
+        await this.app.api.conversations
+          .activities(conversationId)
+          .update(messageId, activity);
+        lastSentContent = content;
+      } catch (error) {
+        this.logger.warn("Teams stream: editMessage failed", { error });
+      }
+      if (!stopped) {
+        scheduleNextEdit();
+      }
+    };
+
+    const scheduleNextEdit = (): void => {
+      timerId = setTimeout(() => {
+        pendingEdit = doEdit();
+      }, intervalMs);
+    };
 
     for await (const chunk of textStream) {
       let text = "";
@@ -1110,18 +1144,36 @@ export class TeamsAdapter implements Adapter<TeamsThreadId, unknown> {
 
       accumulated += text;
 
-      if (messageId) {
-        const activity = new MessageActivity(accumulated);
-        activity.textFormat = "markdown";
-        await this.app.api.conversations
-          .activities(conversationId)
-          .update(messageId, activity);
-      } else {
+      if (!messageId) {
+        // Post the initial message and start the throttled edit timer
         const activity = new MessageActivity(accumulated);
         activity.textFormat = "markdown";
         const res = await this.app.send(conversationId, activity);
         messageId = res.id ?? "";
+        lastSentContent = accumulated;
+        scheduleNextEdit();
       }
+    }
+
+    // Stop the throttle timer
+    stopped = true;
+    if (timerId) {
+      clearTimeout(timerId);
+      timerId = null;
+    }
+
+    // Wait for any in-flight edit to complete
+    if (pendingEdit) {
+      await pendingEdit;
+    }
+
+    // Final edit to ensure the complete accumulated content is posted
+    if (messageId && accumulated !== lastSentContent) {
+      const activity = new MessageActivity(accumulated);
+      activity.textFormat = "markdown";
+      await this.app.api.conversations
+        .activities(conversationId)
+        .update(messageId, activity);
     }
 
     return { id: messageId ?? "", threadId, raw: { text: accumulated } };
